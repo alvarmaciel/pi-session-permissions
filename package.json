@@ -1,0 +1,25 @@
+{
+  "name": "pi-session-permissions",
+  "version": "0.2.0",
+  "description": "OpenCode-style permission rules with session-scoped approvals for Pi",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "permissions"
+  ],
+  "files": [
+    "extensions",
+    "permissions.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/permissions.ts"
+    ]
+  }
+}
