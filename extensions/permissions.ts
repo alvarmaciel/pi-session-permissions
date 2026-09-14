@@ -50,9 +50,13 @@ async function readPolicy(path: string): Promise<Policy | undefined> {
 }
 
 function mergePolicy(base: Policy, override?: Policy): Policy {
-	return override
-		? { tools: { ...base.tools, ...override.tools }, bash: [...base.bash, ...override.bash] }
-		: base;
+	if (!override) return base;
+	return {
+		tools: { ...base.tools, ...override.tools },
+		bash: override.tools.bash === undefined
+			? [...base.bash, ...override.bash]
+			: override.bash,
+	};
 }
 
 function matches(pattern: string, value: string): boolean {
@@ -64,6 +68,15 @@ function needsShellReview(command: string): boolean {
 	return /[\n\r;&|<>`]|\$\(/.test(command) ||
 		(/^find(?:\s|$)/.test(command) &&
 			/-(?:exec|execdir|ok|okdir|delete|fls|fprint|fprint0|fprintf)\b/.test(command));
+}
+
+function toolDecision(toolName: string, policy: Policy): Decision {
+	if (policy.tools[toolName] !== undefined) return policy.tools[toolName];
+	if (toolName === "write" && policy.tools.edit !== undefined) return policy.tools.edit;
+	if ((toolName === "lsp" || toolName.startsWith("lsp_")) && policy.tools.lsp !== undefined) {
+		return policy.tools.lsp;
+	}
+	return policy.tools["*"] ?? "ask";
 }
 
 function bashPermission(command: string, policy: Policy): { decision: Decision; sessionKey: string } {
@@ -92,6 +105,13 @@ function bashPermission(command: string, policy: Policy): { decision: Decision; 
 const checkPolicy = parsePolicy({ permission: { bash: { "*": "ask", "git commit *": "ask" } } }, "test");
 assert.equal(bashPermission("git commit -m test", checkPolicy).sessionKey, "bash rule: git commit *");
 assert.equal(bashPermission('echo "$(rm -rf /)"', parsePolicy({ permission: { bash: { "echo *": "allow" } } }, "test")).decision, "ask");
+assert.equal(bashPermission("pwd", mergePolicy(
+	parsePolicy({ permission: { bash: { pwd: "allow" } } }, "global test"),
+	parsePolicy({ permission: { bash: "deny" } }, "project test"),
+)).decision, "deny");
+assert.equal(toolDecision("lsp_hover", parsePolicy({
+	permission: { lsp: "allow", lsp_hover: "deny" },
+}, "test")), "deny");
 
 export default function (pi: ExtensionAPI) {
 	let policy = emptyPolicy();
@@ -121,15 +141,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		let decision = policy.tools[event.toolName] ?? policy.tools["*"] ?? "ask";
+		let decision = toolDecision(event.toolName, policy);
 		let description = event.toolName;
 		let sessionKey = `${event.toolName}: ${JSON.stringify(event.input)}`;
 
-		if (event.toolName === "write" && policy.tools.write === undefined) {
-			decision = policy.tools.edit ?? decision;
-		} else if ((event.toolName === "lsp" || event.toolName.startsWith("lsp_")) && policy.tools.lsp !== undefined) {
-			decision = policy.tools.lsp;
-		} else if (isToolCallEventType("bash", event)) {
+		if (isToolCallEventType("bash", event)) {
 			description = event.input.command;
 			({ decision, sessionKey } = bashPermission(description, policy));
 		}

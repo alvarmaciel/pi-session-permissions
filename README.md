@@ -60,6 +60,6 @@ Valid decisions are `allow`, `ask`, and `deny`. The `edit` decision also applies
 - Explicitly denied commands never prompt.
 - Approved Bash rules last for the session.
 - Shell composition, substitution, redirection, and mutating `find` actions require approval for the exact command.
-- Non-interactive runs deny anything requiring confirmation.
+- Print and JSON modes deny anything requiring confirmation; RPC can prompt through its UI protocol.
 
 This is a confirmation gate, not an OS sandbox. Use a container or sandbox when commands need hard isolation.
