@@ -65,9 +65,55 @@ function matches(pattern: string, value: string): boolean {
 }
 
 function needsShellReview(command: string): boolean {
-	return /[\n\r;&|<>`]|\$\(/.test(command) ||
+	return /[<>`]|\$\(/.test(command) ||
 		(/^find(?:\s|$)/.test(command) &&
 			/-(?:exec|execdir|ok|okdir|delete|fls|fprint|fprint0|fprintf)\b/.test(command));
+}
+
+function splitShellCommands(command: string): string[] | undefined {
+	const commands: string[] = [];
+	let start = 0;
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+
+	const push = (end: number) => {
+		const part = command.slice(start, end).trim();
+		if (part) commands.push(part);
+	};
+
+	for (let i = 0; i < command.length; i++) {
+		const char = command[i];
+		const next = command[i + 1];
+
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (quote) {
+			if (char === quote) quote = undefined;
+			else if (char === "`" || (char === "$" && next === "(")) return undefined;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			continue;
+		}
+		if (char === "`" || (char === "$" && next === "(") || char === "<" || char === ">" || char === "(" || char === ")") {
+			return undefined;
+		}
+		if (char === "\n" || char === "\r" || char === ";" || char === "|" || char === "&") {
+			push(i);
+			if ((char === "|" || char === "&") && next === char) i++;
+			start = i + 1;
+		}
+	}
+	if (quote) return undefined;
+	push(command.length);
+	return commands.length ? commands : [command.trim()];
 }
 
 function toolDecision(toolName: string, policy: Policy): Decision {
@@ -79,7 +125,7 @@ function toolDecision(toolName: string, policy: Policy): Decision {
 	return policy.tools["*"] ?? "ask";
 }
 
-function bashPermission(command: string, policy: Policy): { decision: Decision; sessionKey: string } {
+function bashPermission(command: string, policy: Policy): { decision: Decision; sessionKey: string; command: string } {
 	const normalized = command.trim();
 	let decision = policy.tools.bash ?? policy.tools["*"] ?? "ask";
 	let matchedPattern: string | undefined;
@@ -92,9 +138,10 @@ function bashPermission(command: string, policy: Policy): { decision: Decision; 
 	}
 
 	if (decision === "allow" && needsShellReview(normalized)) {
-		return { decision: "ask", sessionKey: `bash command: ${normalized}` };
+		return { command: normalized, decision: "ask", sessionKey: `bash command: ${normalized}` };
 	}
 	return {
+		command: normalized,
 		decision,
 		sessionKey: matchedPattern && matchedPattern !== "*"
 			? `bash rule: ${matchedPattern}`
@@ -102,9 +149,34 @@ function bashPermission(command: string, policy: Policy): { decision: Decision; 
 	};
 }
 
+function bashPermissions(command: string, policy: Policy): ReturnType<typeof bashPermission>[] {
+	const normalized = command.trim();
+	const parts = splitShellCommands(normalized);
+	if (!parts) {
+		const permission = bashPermission(normalized, policy);
+		return [{ ...permission, decision: permission.decision === "allow" ? "ask" : permission.decision, sessionKey: `bash command: ${normalized}` }];
+	}
+	return parts.map((part) => bashPermission(part, policy));
+}
+
+const SESSION_PERMISSIONS_KEY = Symbol.for("pi-session-permissions.sessionPermissions");
+
+function getSessionPermissions(): Set<string> {
+	const state = globalThis as typeof globalThis & { [SESSION_PERMISSIONS_KEY]?: Set<string> };
+	return state[SESSION_PERMISSIONS_KEY] ??= new Set<string>();
+}
+
+function shouldClearSessionPermissions(reason: string): boolean {
+	return reason !== "reload";
+}
+
 const checkPolicy = parsePolicy({ permission: { bash: { "*": "ask", "git commit *": "ask" } } }, "test");
 assert.equal(bashPermission("git commit -m test", checkPolicy).sessionKey, "bash rule: git commit *");
+assert.deepEqual(splitShellCommands('ls -la | echo "algo"'), ["ls -la", 'echo "algo"']);
+assert.equal(splitShellCommands('echo "$(rm -rf /)"'), undefined);
 assert.equal(bashPermission('echo "$(rm -rf /)"', parsePolicy({ permission: { bash: { "echo *": "allow" } } }, "test")).decision, "ask");
+assert.deepEqual(bashPermissions("ls -la | echo ok", parsePolicy({ permission: { bash: { "ls *": "allow", "echo *": "ask" } } }, "test")).map(({ decision }) => decision), ["allow", "ask"]);
+assert.equal(bashPermissions("(cd src && ls)", parsePolicy({ permission: { bash: "allow" } }, "test"))[0]?.decision, "ask");
 assert.equal(bashPermission("pwd", mergePolicy(
 	parsePolicy({ permission: { bash: { pwd: "allow" } } }, "global test"),
 	parsePolicy({ permission: { bash: "deny" } }, "project test"),
@@ -112,10 +184,12 @@ assert.equal(bashPermission("pwd", mergePolicy(
 assert.equal(toolDecision("lsp_hover", parsePolicy({
 	permission: { lsp: "allow", lsp_hover: "deny" },
 }, "test")), "deny");
+assert.equal(shouldClearSessionPermissions("reload"), false);
+assert.equal(shouldClearSessionPermissions("new"), true);
 
 export default function (pi: ExtensionAPI) {
 	let policy = emptyPolicy();
-	const sessionPermissions = new Set<string>();
+	const sessionPermissions = getSessionPermissions();
 
 	pi.on("session_start", async (_event, ctx) => {
 		const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -137,30 +211,44 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		policy = loaded;
-		sessionPermissions.clear();
+		if (shouldClearSessionPermissions(_event.reason)) sessionPermissions.clear();
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		let decision = toolDecision(event.toolName, policy);
-		let description = event.toolName;
-		let sessionKey = `${event.toolName}: ${JSON.stringify(event.input)}`;
-
 		if (isToolCallEventType("bash", event)) {
-			description = event.input.command;
-			({ decision, sessionKey } = bashPermission(description, policy));
+			const checks = bashPermissions(event.input.command, policy);
+			const denied = checks.find(({ decision }) => decision === "deny");
+			if (denied) return { block: true, reason: `Blocked by permission policy: ${denied.command}` };
+
+			const pending = checks.filter(({ decision, sessionKey }) => decision === "ask" && !sessionPermissions.has(sessionKey));
+			if (pending.length === 0) return;
+			if (!ctx.hasUI) {
+				return { block: true, reason: `Permission required but no interactive UI is available: ${event.input.command}` };
+			}
+
+			const allowed = await ctx.ui.confirm(
+				"Allow bash commands for this session?",
+				pending.map(({ command, sessionKey }) => `${command}\nScope: ${sessionKey}`).join("\n\n"),
+			);
+			if (!allowed) return { block: true, reason: "Blocked by user" };
+			for (const { sessionKey } of pending) sessionPermissions.add(sessionKey);
+			return;
 		}
+
+		const decision = toolDecision(event.toolName, policy);
+		let sessionKey = `${event.toolName}: ${JSON.stringify(event.input)}`;
 		if (event.toolName === "edit" || event.toolName === "write") sessionKey = `tool: ${event.toolName}`;
 
 		if (decision === "allow") return;
-		if (decision === "deny") return { block: true, reason: `Blocked by permission policy: ${description}` };
+		if (decision === "deny") return { block: true, reason: `Blocked by permission policy: ${event.toolName}` };
 		if (sessionPermissions.has(sessionKey)) return;
 		if (!ctx.hasUI) {
-			return { block: true, reason: `Permission required but no interactive UI is available: ${description}` };
+			return { block: true, reason: `Permission required but no interactive UI is available: ${event.toolName}` };
 		}
 
 		const allowed = await ctx.ui.confirm(
 			`Allow ${event.toolName} for this session?`,
-			`${description}\n\nScope: ${sessionKey}`,
+			`${event.toolName}\n\nScope: ${sessionKey}`,
 		);
 		if (!allowed) return { block: true, reason: "Blocked by user" };
 		sessionPermissions.add(sessionKey);
